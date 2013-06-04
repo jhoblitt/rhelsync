@@ -1,0 +1,150 @@
+#!/usr/bin/env perl
+
+# Copyright (c) 2012-2013  Joshua Hoblitt
+
+use strict;
+use warnings;
+
+use vars qw( $VERSION );
+$VERSION = '1';
+
+use File::Spec;
+use Getopt::Long qw( GetOptions :config auto_help auto_version );
+use Pod::Usage qw( pod2usage );
+# use the pre "2.0" mkpath so we may work with perl 5.8/rhel5.x (untested)
+use File::Path qw( mkpath );
+
+my $verbose       = 0;
+my $syncpath    = "/home/rhel/download";
+my $repopath    = "/home/rhel/repos";
+my $reposync    = "/usr/bin/reposync";
+my $createrepo  = "/usr/bin/createrepo";
+my $rsync       = "/usr/bin/rsync";
+my $arch        = `/bin/arch`;
+chomp $arch;
+
+# --version & --help are handled for us
+GetOptions(
+    'verbose|v'     => \$verbose,
+    'syncpath|p=s'  => \$syncpath,
+    'repopath|p=s'  => \$repopath,
+    'createrepo=s'  => \$createrepo,
+    'reposync=s'    => \$reposync,
+    'rsync=s'       => \$rsync,
+) ||  pod2usage( 2 );
+pod2usage( -msg => "Unknown option: @ARGV", -exitval => 2 ) if @ARGV;
+
+check_binary('createrepo', $createrepo);
+check_binary('reposync', $reposync);
+check_binary('rsync', $rsync);
+
+check_path('syncpath', $syncpath);
+check_path('repopath', $repopath);
+
+
+# get a list of all rhn channels that we are subscribed too
+# rhn-channel --list
+# rhel-x86_64-server-6
+# rhel-x86_64-server-optional-6
+# rhel-x86_64-server-supplementary-6
+
+# an array of all channel id that we are subscribed to
+my @channels;
+# a string of channel ids suitable to be passed to reposync
+my $repoids = "";
+foreach my $chan (`rhn-channel --list`) {
+    chomp $chan;
+    print "found rhn channel: $chan\n" if $verbose;
+    push @channels, $chan;
+ 
+    if (length $repoids == 0) {
+        $repoids .= "--repoid=$chan";
+    } else {
+        # if we're the 2+ repoid, add leading whitespace
+        $repoids .= " --repoid=$chan";
+    }
+}
+
+die "There don't appear to be any active channel subscriptions" unless
+    scalar @channels;
+
+# syntax for calling reposync
+#
+# reposync --gpgcheck -l --repoid=rhel-x86_64-server-6 --download_path=/home/rhel/rhel-x86_64-server-6
+#
+#reposync --gpgcheck -l --repoid=rhel-x86_64-server-6 --repoid=rhel-x86_64-server-optional-6 --repoid=rhel-x86_64-server-supplementary-6 --download_path=/home/rhel-x86_64-server-updates-6
+#
+# reposync -q flag == quiet
+
+my $reposync_opts = "";
+$reposync_opts .= "-q" unless $verbose;
+my $reposync_cmd = "$reposync $reposync_opts --gpgcheck -l $repoids --download_path=$syncpath";
+print "running: $reposync_cmd\n" if $verbose;
+system($reposync_cmd) == 0
+    or die "$reposync failed: $?";
+
+# reposync's path construction is somewhat obnoxous.  Each channel subscription
+# is mirrored into the path <download_path>/<channel id>/getPackage/
+#
+# I prefer my repos to be <repo name>/<lsb major release>/<arch> but since the
+# repo name includes the release info, we'll shorten that to <repo name>/<arch>
+
+my $exit_status = 0;
+foreach my $chan (@channels) {
+    my $sync_dir = File::Spec->catfile($syncpath, $chan, 'getPackage');
+    my $repo_dir = File::Spec->catfile($repopath, $chan, $arch);
+
+    mkpath($repo_dir);
+    unless (-d $repo_dir) {
+        warn "$repo_dir does not exist and can not be created";
+        $exit_status++;
+        next;
+    }
+
+    # rsync is quiet by default, -v for verbose
+    my $rsync_opts = "";
+    $rsync_opts .= "-v" if $verbose;
+    # have rsync blow away everything but the repodata.  if $repo_dir is on the
+    # same filesystems as $sync_dir, use hardlinks instead of copying
+    # XXX --delete is really going to hurt if $repo_dir & $sync_dir are on
+    # different filesystems
+    my $rsync_cmd = "$rsync $rsync_opts -a --delete --exclude='repodata/' --link-dest=$sync_dir $sync_dir/ $repo_dir";
+    print "running: $rsync_cmd\n" if $verbose;
+    system($rsync_cmd);
+    if ($? != 0) {
+        warn "rsync failed: $?";
+        $exit_status++;
+    }
+
+    # createrepo is moderately verbose by default, -v for really verbose, -q
+    #for quiet
+    my $createrepo_opts = "-q";
+    $createrepo_opts = "-v" if $verbose;
+    my $createrepo_cmd = "$createrepo $createrepo_opts --database --update $repo_dir";
+    print "running: $createrepo_cmd\n" if $verbose;
+    system($createrepo_cmd);
+    if ($? != 0) {
+        warn "rcreaterepo failed: $?";
+        $exit_status++;
+    }
+}
+
+exit($exit_status);
+
+sub check_binary {
+    my ($option, $bin) = @_;
+
+    pod2usage( -msg => "--$option $bin: binary does not exist", -exitval => 2 )
+        unless -e $bin;
+    pod2usage( -msg => "--$option $bin: binary is not executable", -exitval => 2 )
+        unless -x $bin;
+}
+
+sub check_path {
+    my ($option, $path) = @_;
+
+    pod2usage( -msg => "--$option $path: path does not exist", -exitval => 2 )
+        unless -e $path;
+    pod2usage( -msg => "--$option $path: path is not a directory", -exitval => 2 )
+        unless -d $path;
+}
